@@ -303,6 +303,8 @@ Decision and shape:
 
 2026-09-29 (I1 delivery): the fork's `main` advanced to upstream `08de420c`; PR #11 conflicted only on the import block of `tests/gentle-shell.test.ts`. Merged `origin/main` into `feat/session-usage-record`, combined both import lines, focused tests 300/300, typecheck 187 no regressions, independent verification passed, and pushed the merge commit. PR #11 back to MERGEABLE.
 
+2026-09-29 (I2 bug found on real resume): the live bar showed exactly the orchestrator-only total ($0.264 when parent-only was $0.264 and parent+subagents was $0.284). Root cause: on a resumed session the delegated total is published while the TaskStore restores, before the shell's session is ready, and it was never re-published, so the restored subagents' cost was lost. Fix: `gentle-agents` re-publishes the delegated total on a scheduled task after `session_start` (all handlers have run), and `gentle-shell` gates the subscriber on the live context and stashes a payload that arrives before `session_start`. Verified live via temporary debug logs: publish tasks:2 nanoUsd:19644498 -> shell apply. Focused tests 299 + gentle-agents 126 green; typecheck 187 no regressions.
+
 ## Next step
 
 Commit the I1 work units on `feat/session-usage-record`, then implement I2 (issue #10), which consumes `delegatedCostFromTasks` and publishes the delegated-cost topic. Deliberately not done: pushing, opening a PR, or commenting on upstream #1545.
