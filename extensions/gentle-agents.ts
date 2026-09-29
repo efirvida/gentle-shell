@@ -515,6 +515,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const tasks = visibleTasks();
 		if (tasks.some((task) => !isFinished(task.status))) {
 			cancelClock = deps.schedule(() => {
+				publishDelegatedCost();
 				requestRender();
 				tickClock();
 			}, CLOCK_TICK_MS);
@@ -661,7 +662,6 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			if (outcome === "replied") messages.consumeQuery(taskId, requestId);
 			else messages.expireQuery(taskId, requestId);
 		},
-		onUsage: () => publishDelegatedCost(),
 		onSuccessfulMutation: (task, tool) => {
 			// Same-clone registry attribution remains unchanged. A foreign task
 			// uses a separately bound, live-grant path only for successful tool evidence.
