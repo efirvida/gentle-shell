@@ -8,6 +8,8 @@ import { resolveProfilePin } from "../lib/agent-profile-pin.ts";
 import * as os from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { buildShellHeaderModel, renderShellBar, renderShellBottomOnlyBar, renderShellHeaderBar, renderShellHeaderRule, renderShellSidebarBar, shellEnabled, type ShellBarModel, type ShellBarTheme } from "../lib/shell-bar.ts";
+import { EMPTY_SESSION_COST, mergeSessionCost, sessionCostFromEntries, sessionCostUsd, type SessionCostTotal } from "../lib/session-usage.ts";
+import { decodeDelegatedSessionCost, SESSION_DELEGATED_COST_EVENT, type DelegatedSessionCostPayload } from "../lib/session-delegated-cost.ts";
 import { CHANGE_STATUS, RootBranchLabels, renderChangesWidget, type ChangedFile, type ChangesModel, type GitRunner, type WorktreeChanges } from "../lib/shell-changes.ts";
 import { WorktreeChangesView } from "../lib/shell-changes-view.ts";
 import { SessionWorktreeRegistry, resolveSessionWorktree, worktreeGitEnvironment, type WorktreeResolver, type WorktreeIdentity } from "../lib/session-worktree-registry.ts";
@@ -146,6 +148,10 @@ interface BuildOptions {
 	home?: string;
 	dirty?: number;
 	usage?: ProviderUsage;
+	/** Precomputed orchestrator total from the shell's per-session cache; avoids a scan during render. */
+	sessionCost?: SessionCostTotal;
+	/** Latest delegated total published by the agents extension; absent means none known. */
+	delegatedCost?: SessionCostTotal;
 }
 
 export type DevBinaryNotice = { state: "active"; path: string; sha256: string } | { state: "invalid"; reason: string };
@@ -228,28 +234,17 @@ function ambientDevBinary(): DevBinaryNotice | undefined {
 
 const defaultShellDeps: Omit<ShellDeps, "activeProfile"> = { fetch: (input, init) => globalThis.fetch(input, init), now: () => Date.now(), devBinary: ambientDevBinary, resolveWorktree: resolveSessionWorktree, gitRunner: shellGitRunner };
 
-interface AssistantUsageEntry {
-	type: string;
-	message?: {
-		role?: string;
-		usage?: {
-			cost?: { total?: number };
-		};
-	};
-}
-
 function shortenHome(cwd: string, home: string | undefined): string {
 	if (home && cwd.startsWith(home)) return `~${cwd.slice(home.length)}`;
 	return cwd;
 }
 
-function sessionCost(ctx: ExtensionContext): number {
-	let total = 0;
-	for (const entry of ctx.sessionManager.getEntries() as AssistantUsageEntry[]) {
-		if (entry.type !== "message" || entry.message?.role !== "assistant") continue;
-		total += entry.message.usage?.cost?.total ?? 0;
-	}
-	return total;
+// The session's own cost, carrying provenance so an unreported component is
+// never indistinguishable from a reported $0. The fold lives in the pure
+// session-usage module; this stays a thin adapter over the public session
+// manager so a future statistics plugin can apply the same rule.
+export function sessionCost(ctx: ExtensionContext): SessionCostTotal {
+	return sessionCostFromEntries(ctx.sessionManager.getEntries());
 }
 
 export function buildShellBarModel(
@@ -264,6 +259,8 @@ export function buildShellBarModel(
 	const statuses = Array.from(footerData.getExtensionStatuses().entries())
 		.sort(([a], [b]) => a.localeCompare(b))
 		.map(([, text]) => text);
+	const parentCost = options.sessionCost ?? sessionCost(ctx);
+	const totalCost = options.delegatedCost ? mergeSessionCost(parentCost, options.delegatedCost) : parentCost;
 	return {
 		cwd: shortenHome(ctx.sessionManager.getCwd(), home),
 		profile: options.profile,
@@ -274,7 +271,8 @@ export function buildShellBarModel(
 		effort: model?.reasoning ? pi.getThinkingLevel() : undefined,
 		contextPercent: usage?.percent ?? null,
 		contextWindow: usage?.contextWindow ?? model?.contextWindow ?? 0,
-		costTotal: sessionCost(ctx),
+		costTotal: sessionCostUsd(totalCost),
+		costPartial: !totalCost.complete,
 		subscription: model ? ctx.modelRegistry.isUsingOAuth(model) : false,
 		usage: options.usage,
 		statuses,
@@ -290,6 +288,8 @@ export function createShellBarComponent(
 	dirty: () => number | undefined = () => undefined,
 	usage: () => ProviderUsage | undefined = () => undefined,
 	presentation?: () => ReturnType<typeof resolveVisualSettings>["settings"],
+	/** Cached per-session totals, refreshed by events, never scanned during render. */
+	costs: () => { parent: SessionCostTotal; delegated: SessionCostTotal | undefined } = () => ({ parent: EMPTY_SESSION_COST, delegated: undefined }),
 ): ShellBarComponent {
 	const unsubscribe = footerData.onBranchChange(() => {
 		host.invalidateSidebar?.();
@@ -297,7 +297,8 @@ export function createShellBarComponent(
 	});
 	return {
 		render(width: number) {
-			return renderShellBar(buildShellBarModel(pi, ctx, footerData, { dirty: dirty(), usage: usage() }), theme, width, presentation?.());
+			const cost = costs();
+			return renderShellBar(buildShellBarModel(pi, ctx, footerData, { dirty: dirty(), usage: usage(), sessionCost: cost.parent, delegatedCost: cost.delegated }), theme, width, presentation?.());
 		},
 		invalidate() {},
 		dispose() {
@@ -1688,6 +1689,44 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	let changes: SessionChanges | undefined;
 	let registry: SessionWorktreeRegistry | undefined;
 	let currentContext: ExtensionContext | undefined;
+	// I2 cost state. The orchestrator total is refreshed by provider-response and
+	// session-tree events; the delegated total by the agents extension's versioned
+	// topic. Render reads these fields, never `getEntries()` and never I/O.
+	let parentCost: SessionCostTotal = EMPTY_SESSION_COST;
+	let parentCostContext: ExtensionContext | undefined;
+	let delegatedCost: SessionCostTotal | undefined;
+	let pendingDelegatedCost: DelegatedSessionCostPayload | undefined;
+	let lastDelegatedSeq = -1;
+	/** Recompute the orchestrator's own total from the live session entries (event boundary only, never a render). */
+	const refreshParentCost = (ctx: ExtensionContext) => {
+		parentCost = sessionCost(ctx);
+		parentCostContext = ctx;
+	};
+	/** The cached orchestrator total for this context, refreshed only when the context changes. */
+	const cachedParentCost = (ctx: ExtensionContext): SessionCostTotal => {
+		if (parentCostContext !== ctx) refreshParentCost(ctx);
+		return parentCost;
+	};
+	/** The two halves the bar folds: the cached orchestrator total and the last delegated total. */
+	const costTotals = (ctx: ExtensionContext) => ({ parent: cachedParentCost(ctx), delegated: delegatedCost });
+	/** Apply a decoded delegated total for the active session, ignoring a foreign or
+	 * out-of-order event. Ordering uses the publisher's monotonic sequence, not the
+	 * wall clock, so a clock adjustment cannot make a newer total look stale. */
+	const applyDelegatedCost = (payload: DelegatedSessionCostPayload) => {
+		const sessionId = currentContext?.sessionManager.getSessionId();
+		if (sessionId === undefined || payload.parentSessionId !== sessionId) return;
+		if (payload.seq < lastDelegatedSeq) return;
+		lastDelegatedSeq = payload.seq;
+		delegatedCost = { nanoUsd: payload.nanoUsd, complete: payload.complete, absent: payload.absent };
+		renderHost?.invalidateSidebar?.();
+		renderHost?.requestRender();
+	};
+	const unsubscribeDelegatedCost = pi.events.on(SESSION_DELEGATED_COST_EVENT, (value) => {
+		const payload = decodeDelegatedSessionCost(value);
+		if (!payload) return;
+		if (currentContext === undefined) { pendingDelegatedCost = payload; return; }
+		applyDelegatedCost(payload);
+	});
 	let review: ReviewSidebarSnapshot | undefined;
 	const redrawReview = () => {
 		renderHost?.invalidateSidebar?.();
@@ -1702,9 +1741,14 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 	});
 	pi.on("session_tree", () => {
 		review = undefined;
+		if (currentContext) refreshParentCost(currentContext);
 		redrawReview();
 	});
-	let shown = "";
+	// Cost is refreshed on the turn boundary, after the assistant entry is
+	// persisted, so the bar's cached total never reads a stale scan.
+	pi.on("turn_end", (_event, ctx) => {
+		refreshParentCost(ctx);
+	});	let shown = "";
 	const applyChanges = (ctx: ExtensionContext, model: ChangesModel) => {
 		const fingerprint = changesFingerprint(model);
 		if (fingerprint === shown) return;
@@ -1746,6 +1790,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		stopProfilePoll();
 		registry?.close();
 		currentContext = ctx;
+		refreshParentCost(ctx);
+		delegatedCost = undefined;
+		lastDelegatedSeq = -1;
+		if (pendingDelegatedCost) { applyDelegatedCost(pendingDelegatedCost); pendingDelegatedCost = undefined; }
 		changes = undefined;
 		registry = new SessionWorktreeRegistry(pi, ctx.sessionManager, ctx.cwd, deps.resolveWorktree);
 		registry.start();
@@ -1769,13 +1817,13 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 			sidebarTui = tui;
 			if (tui.terminal) sidebarState(tui).visibility = { todo: visualSettings.visibility.todo };
 			renderHost = { requestRender: () => tui.requestRender(), invalidateSidebar: () => invalidateSidebar(tui) };
-			const bottom = createShellBarComponent(pi, ctx, renderHost, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""), () => visualSettings);
+			const bottom = createShellBarComponent(pi, ctx, renderHost, theme, footerData, () => tracker.model.files.length, () => usage.get(ctx.model?.provider ?? ""), () => visualSettings, () => costTotals(ctx));
 			// The Status card paints live session state that no event re-registers a
 			// part for: model, effort, context, cost, session name and extension
 			// statuses. The digest is what keeps the fullscreen memo honest, and it
 			// rebuilds the model exactly as the narrow bottom bar does every frame.
 			const footerModel = (): ShellBarModel => ({
-				...buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? ""), profile: deps.activeProfile() }),
+				...buildShellBarModel(pi, ctx, footerData, { dirty: tracker.model.files.length, usage: usage.get(ctx.model?.provider ?? ""), profile: deps.activeProfile(), sessionCost: cachedParentCost(ctx), delegatedCost }),
 				changes: { files: tracker.model.files.length, added: tracker.model.added, deleted: tracker.model.deleted, notice: tracker.model.notice },
 				review,
 			});
@@ -1856,6 +1904,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		// Pi rebuilds the extension runtime after every shutdown (reload, replacement,
 		// fork, quit), so the factory-level subscription never needs to be restored.
 		unsubscribeReview();
+		unsubscribeDelegatedCost();
 		stopProfilePoll();
 		oddPhaseRegistry.clear(ctx.sessionManager.getSessionId());
 		oddPhaseRegistry.clearRenderRequest(ctx.sessionManager.getSessionId());
@@ -1870,6 +1919,10 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		registry = undefined;
 		changes = undefined;
 		currentContext = undefined;
+		parentCost = EMPTY_SESSION_COST;
+		parentCostContext = undefined;
+		delegatedCost = undefined;
+		pendingDelegatedCost = undefined;
 		unsubscribeWorktrees();
 	});
 	const openChanges = async (ctx: ExtensionContext) => {
@@ -2364,6 +2417,7 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 		}
 	});
 	pi.on("agent_end", async (_event, ctx) => {
+		refreshParentCost(ctx);
 		await refreshChanges(ctx);
 		void refreshUsage(ctx, false);
 	});

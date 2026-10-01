@@ -44,6 +44,8 @@ import { resolveGentlePiAgentHome, gentlePiConfigHome } from "../lib/agent-home.
 import { resolveProfilePin, resolveUnversionedProjectProfile } from "../lib/agent-profile-pin.ts";
 import { allowedEditSurfaces, isDevelopmentSurface, isGenericBoundedWriter, prepareBoundSessionRepository, rejectUnscopedBoundedWriterDispatch, safeBootstrapDirectory, sessionRepositoryAuthority } from "../lib/bounded-writer-admission.ts";
 import { CHILD_METRICS_EVENT, CHILD_METRICS_REVOKED, childEvent, launchSelection, type LaunchSelection } from "../lib/runtime-metrics-children.ts";
+import { delegatedCostFromTasks } from "../lib/session-usage.ts";
+import { clampDelegatedCount, delegatedSessionCostEvent, SESSION_DELEGATED_COST_EVENT } from "../lib/session-delegated-cost.ts";
 import { runtimeMetricsEnvAllows, type RuntimeMetricsPolicyDeps } from "../lib/runtime-metrics-policy.ts";
 
 // Gentle Agents: subagents as isolated `pi --mode rpc` children, a task
@@ -438,6 +440,30 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// started before /new or /resume stays in the store and comes back with
 	// its session. Before the first session_start there is nothing to scope by.
 	const activeSessionId = (): string | undefined => (sessions === undefined ? undefined : sessions.getSessionId() ?? "");
+	// The shell owns the bar, this extension owns the TaskStore; the delegated
+	// total crosses over the event bus on one versioned topic. Derived from
+	// `store.list`, not from the card's finished-row TTL, so the number never
+	// shrinks a minute after an agent finishes. A monotonic sequence orders the
+	// events; diagnostic counts are clamped to the payload bound because the
+	// store retains every finished task. Failures never reach the session.
+	let delegatedSequence = 0;
+	const publishDelegatedCost = () => {
+		if (!sessions) return;
+		const parentSessionId = activeSessionId();
+		if (parentSessionId === undefined || parentSessionId.length === 0) return;
+		try {
+			const tasks = store.list(parentSessionId);
+			const total = delegatedCostFromTasks(tasks);
+			const event = delegatedSessionCostEvent({
+				parentSessionId,
+				seq: (delegatedSequence += 1),
+				total: { ...total, absent: clampDelegatedCount(total.absent) },
+				subagents: clampDelegatedCount(tasks.length),
+				at: deps.now(),
+			});
+			if (event) pi.events.emit(SESSION_DELEGATED_COST_EVENT, event);
+		} catch { /* Statistics must never interrupt the agents flow. */ }
+	};
 	// Pi 0.86.1 adds this event; the package's pinned 0.85.1 types predate it.
 	installBackgroundCacheWarming(pi as unknown as Parameters<typeof installBackgroundCacheWarming>[0], () => ({
 		sessionId: activeSessionId(),
@@ -552,6 +578,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const tasks = visibleTasks();
 		if (tasks.some((task) => !isFinished(task.status))) {
 			cancelClock = deps.schedule(() => {
+				publishDelegatedCost();
 				requestRender();
 				tickClock();
 			}, CLOCK_TICK_MS);
@@ -984,6 +1011,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	// A status change is worth a frame right away; deltas inside a task are
 	// coalesced so a chatty child cannot flood the terminal.
 	store.subscribeSummary(() => {
+		publishDelegatedCost();
 		publishActivity();
 		if (sidebarTui) invalidateSidebar(sidebarTui);
 		host?.requestRender();
@@ -1516,6 +1544,10 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		const sessionId = ctx.sessionManager.getSessionId();
 		const preexisting = event.reason === "resume" || (event.reason === "startup" && ctx.sessionManager.getEntries().length > 0);
 		if (preexisting && sessionId) void restoreSessionHistory(ctx, sessionId);
+		// Re-publish after every session_start handler has run, so the shell's
+		// subscriber is registered and has its session before the delegated total
+		// crosses the bus (otherwise a resumed session's restored tasks are lost).
+		deps.schedule(() => publishDelegatedCost(), 0);
 		try {
 			presence = PresencePublisher.start({ profile: agentHome, sessionId: activeSessionId() ?? "",
 				label: ctx.sessionManager.getSessionName?.() || ctx.sessionManager.getCwd().split(/[\\/]/).pop() || "Orchestrator", activity: [] });
