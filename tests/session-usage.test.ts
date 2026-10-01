@@ -19,6 +19,7 @@ import {
 	type SessionUsageRecord,
 	type TimeSegment,
 	type TurnRecord,
+	type UsageCostBreakdown,
 } from "../lib/session-usage.ts";
 
 // I1: the canonical SessionUsageRecord and its money primitive. A reported $0
@@ -141,7 +142,30 @@ test("SessionUsageRecord, TimeSegment and TurnRecord expose the canonical shape"
 	assert.equal(Object.keys(record.tokens).length, 6);
 	assert.equal(record.source, "subagent");
 
+	// I3: the per-component split is additive on the canonical record; each
+	// component keeps its own reported/absent provenance.
+	const breakdown: UsageCostBreakdown = {
+		input: reportedCost(0.00007485),
+		output: reportedCost(0.0002364),
+		cacheRead: reportedCost(0.000033024),
+		cacheWrite: reportedCost(0),
+	};
+	const split: SessionUsageRecord = { ...record, costBreakdown: breakdown };
+	assert.deepEqual(split.costBreakdown, breakdown);
+	assert.deepEqual(split.costBreakdown?.cacheWrite, reportedCost(0));
+	assert.equal(split.costBreakdown?.cacheWrite.state, "reported");
+
 	const segment: TimeSegment = { kind: "tool", start: 1, end: 3, tool: "bash", callId: "c1" };
 	const turn: TurnRecord = { index: 0, start: 1, end: 5, model: record.model, segments: [segment] };
 	assert.equal(turn.segments[0]?.kind, "tool");
+});
+
+test("accumulateTaskCost stays on the nano-USD grid across repeated deltas", () => {
+	let task: { cost: number; costComplete?: boolean } = { cost: 0 };
+	for (const delta of [0.00007485, 0.0002364, 0.000033024]) task = { ...task, ...accumulateTaskCost(task, reportedCost(delta)) };
+	assert.equal(task.cost, 0.000344274, "nine-decimal deltas sum exactly, not with float drift");
+	assert.equal(reportedCost(task.cost).nanoUsd, 344_274);
+	let long: { cost: number; costComplete?: boolean } = { cost: 0 };
+	for (let index = 0; index < 1_000; index++) long = { ...long, ...accumulateTaskCost(long, reportedCost(0.000000001)) };
+	assert.equal(reportedCost(long.cost).nanoUsd, 1_000, "one-nano deltas do not accumulate error");
 });

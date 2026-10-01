@@ -28,6 +28,7 @@ export function reportedCost(usd: number): ReportedUsageCost {
 /** The provider reported no cost at all; it is not a reported zero. */
 export const ABSENT_COST: AbsentUsageCost = { state: "absent" };
 
+/** True when the provider reported this component's cost (a reported zero included). */
 export function isReported(cost: UsageCost): cost is ReportedUsageCost {
 	return cost.state === "reported";
 }
@@ -56,6 +57,19 @@ export interface UsageTokens {
 }
 
 /**
+ * The provider's per-component cost split, each component carrying its own
+ * provenance. A billing report needs input/output/cache separately, and "the
+ * provider reported this component" must stay distinguishable from "the
+ * provider reported nothing" exactly as the total does.
+ */
+export interface UsageCostBreakdown {
+	readonly input: UsageCost;
+	readonly output: UsageCost;
+	readonly cacheRead: UsageCost;
+	readonly cacheWrite: UsageCost;
+}
+
+/**
  * The one canonical shape every statistics issue consumes. Parent and child
  * transcripts share this record shape; `taskId` is present only for a
  * delegated child.
@@ -70,6 +84,8 @@ export interface SessionUsageRecord {
 	readonly effort?: string;
 	readonly tokens: UsageTokens;
 	readonly cost: UsageCost;
+	/** Present when the source carries a per-component split; a transcript does. */
+	readonly costBreakdown?: UsageCostBreakdown;
 }
 
 /**
@@ -112,10 +128,12 @@ export class SessionCostAccumulator {
 	}
 }
 
+/** Fold one usage component into an existing total, preserving provenance. */
 export function addSessionCost(total: SessionCostTotal, cost: UsageCost): SessionCostTotal {
 	return new SessionCostAccumulator(total).add(cost).total();
 }
 
+/** Fold many usage components into one provenance-carrying total. */
 export function foldSessionCost(costs: Iterable<UsageCost>): SessionCostTotal {
 	const accumulator = new SessionCostAccumulator();
 	for (const cost of costs) accumulator.add(cost);
@@ -176,8 +194,12 @@ export interface TaskCostLike {
 }
 
 /** Task accumulation (I1): apply one child usage delta while remembering whether any component was absent. */
+/** Task accumulation (I1): apply one child usage delta while remembering whether
+ * any component was absent. Each step stays on the integer nano-USD grid, so
+ * repeated nine-decimal additions cannot drift before the delegated fold. */
 export function accumulateTaskCost(current: TaskCostLike, cost: UsageCost): { cost: number; costComplete: boolean } {
-	return { cost: current.cost + costUsd(cost), costComplete: current.costComplete !== false && cost.state === "reported" };
+	const nanoUsd = reportedCost(current.cost).nanoUsd + (cost.state === "reported" ? cost.nanoUsd : 0);
+	return { cost: nanoUsd / NANO_USD_SCALE, costComplete: current.costComplete !== false && cost.state === "reported" };
 }
 
 /** Delegated ingestion (I2): fold every subagent's known cost into one partial-aware total for the bar. */
