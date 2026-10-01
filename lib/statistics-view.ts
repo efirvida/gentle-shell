@@ -41,6 +41,7 @@ export interface StatisticsRow {
 	readonly costNanoUsd: number;
 	readonly costProvenance: FigureProvenance;
 	readonly tokens: number;
+	readonly tokensProvenance: FigureProvenance;
 }
 
 export interface StatisticsRatio {
@@ -101,7 +102,7 @@ function ratio(value: number | null): string {
 }
 
 function rowFrom(key: string, title: string, subtitle: string | undefined, bucket: UsageBucket): StatisticsRow {
-	return { key, title, ...(subtitle !== undefined && subtitle.length > 0 ? { subtitle } : {}), turns: bucket.turns, costNanoUsd: bucket.cost.nanoUsd, costProvenance: bucket.cost.provenance, tokens: bucket.tokens.total };
+	return { key, title, ...(subtitle !== undefined && subtitle.length > 0 ? { subtitle } : {}), turns: bucket.turns, costNanoUsd: bucket.cost.nanoUsd, costProvenance: bucket.cost.provenance, tokens: bucket.tokens.total, tokensProvenance: bucket.tokens.provenance };
 }
 
 /** Build the display model from the aggregate and the optional timeline. Pure. */
@@ -163,6 +164,11 @@ function costText(model: StatisticsModel): string {
 	return `${usdFromNano(model.costNanoUsd)}${marker}`;
 }
 
+/** The token total with the same partial marker the cost uses; a partial sum is never a measured zero. */
+function tokensText(tokens: UsageBucket["tokens"]): string {
+	return `${formatTokens(tokens.total)}${tokens.provenance === "partial" ? "+" : ""} tokens`;
+}
+
 function timeSplit(model: StatisticsModel): string {
 	if (!model.timeline) return "n/a";
 	return `model ${formatDuration(model.timeline.modelMs)} · tools ${formatDuration(model.timeline.toolMs)} · idle ${formatDuration(model.timeline.idleMs)} (est.)`;
@@ -171,7 +177,7 @@ function timeSplit(model: StatisticsModel): string {
 function rowLines(row: StatisticsRow, width: number, style: StatisticsStyle): string[] {
 	const lines: string[] = [`  ${style.accent(row.title)}${row.subtitle ? style.dim(`  ${row.subtitle}`) : ""}`];
 	const marker = row.costProvenance === "partial" ? "+" : "";
-	lines.push(`    ${wrapParts([`${row.turns} turn${row.turns === 1 ? "" : "s"}`, `${usdFromNano(row.costNanoUsd)}${marker}`, `${formatTokens(row.tokens)} tokens`], width - 4).join("\n    ")}`);
+	lines.push(`    ${wrapParts([`${row.turns} turn${row.turns === 1 ? "" : "s"}`, `${usdFromNano(row.costNanoUsd)}${marker}`, `${formatTokens(row.tokens)}${row.tokensProvenance === "partial" ? "+" : ""} tokens`], width - 4).join("\n    ")}`);
 	return lines;
 }
 
@@ -190,7 +196,7 @@ function footerText(options: StatisticsRenderOptions): string {
 function renderNarrow(model: StatisticsModel, width: number, style: StatisticsStyle, options: StatisticsRenderOptions): string[] {
 	const lines: string[] = [];
 	lines.push(style.title("Session statistics"));
-	for (const line of wrapParts([costText(model), `${model.turns} turns`, `${formatTokens(model.tokens.total)} tokens`, model.timeline ? formatDuration(model.timeline.wallClockMs) : "n/a"], width)) lines.push(line);
+	for (const line of wrapParts([costText(model), `${model.turns} turns`, tokensText(model.tokens), model.timeline ? formatDuration(model.timeline.wallClockMs) : "n/a"], width)) lines.push(line);
 	if (model.timeline) for (const line of wrapParts([`model ${formatDuration(model.timeline.modelMs)}`, `tools ${formatDuration(model.timeline.toolMs)}`, `idle ${formatDuration(model.timeline.idleMs)} (est.)`], width)) lines.push(style.dim(line));
 	if (!options.compact) lines.push("");
 	lines.push(style.accent("Helpers"));
@@ -215,7 +221,7 @@ function renderWide(model: StatisticsModel, width: number, style: StatisticsStyl
 	const inner = Math.max(1, width - 4);
 	const content: string[] = [];
 	if (!options.compact) content.push("");
-	for (const line of wrapParts([costText(model), `${model.turns} turns`, `${formatTokens(model.tokens.total)} tokens`, model.timeline ? formatDuration(model.timeline.wallClockMs) : "n/a"], inner)) content.push(`  ${line}`);
+	for (const line of wrapParts([costText(model), `${model.turns} turns`, tokensText(model.tokens), model.timeline ? formatDuration(model.timeline.wallClockMs) : "n/a"], inner)) content.push(`  ${line}`);
 	if (model.timeline) content.push(`  ${style.dim(timeSplit(model))}`);
 	if (!options.compact) content.push("");
 	content.push(style.accent("  Helpers"));

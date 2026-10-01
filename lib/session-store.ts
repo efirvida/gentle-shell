@@ -100,6 +100,8 @@ export interface StoredUsageLine {
 			readonly cacheWrite: number;
 			readonly reasoning: number;
 			readonly totalTokens: number;
+			/** Present only when the source omitted a counter, so the round trip stays honest. */
+			readonly tokensComplete?: boolean;
 			readonly cost?: Readonly<Record<string, number>>;
 		};
 	};
@@ -160,6 +162,7 @@ export function usageLineFromRecord(record: TranscriptUsageRecord): StoredUsageL
 				cacheWrite: record.tokens.cacheWrite,
 				reasoning: record.tokens.reasoning,
 				totalTokens: record.tokens.total,
+				...(record.tokensComplete === false ? { tokensComplete: false } : {}),
 				...(Object.keys(cost).length > 0 ? { cost } : {}),
 			},
 		},

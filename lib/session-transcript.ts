@@ -136,6 +136,14 @@ function count(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0;
 }
 
+/**
+ * A token counter is reported only when the source carried a finite number; an
+ * omitted counter stays `undefined` instead of becoming a measured zero.
+ */
+function tokenCount(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : undefined;
+}
+
 function text(value: unknown, fallback: string): string {
 	return typeof value === "string" && value.length > 0 ? value : fallback;
 }
@@ -183,14 +191,27 @@ export function parseTranscriptLine(line: string, context: TranscriptReadContext
 	if (timestamp === undefined) return { kind: "malformed" };
 	const costSource = usage.cost;
 	const total = isObject(costSource) ? costSource.total : undefined;
-	const tokens: UsageTokens = {
-		input: count(usage.input),
-		output: count(usage.output),
-		cacheRead: count(usage.cacheRead),
-		cacheWrite: count(usage.cacheWrite),
-		reasoning: count(usage.reasoning),
-		total: count(usage.totalTokens ?? usage.total),
+	const counts = {
+		input: tokenCount(usage.input),
+		output: tokenCount(usage.output),
+		cacheRead: tokenCount(usage.cacheRead),
+		cacheWrite: tokenCount(usage.cacheWrite),
+		reasoning: tokenCount(usage.reasoning),
+		total: tokenCount(usage.totalTokens ?? usage.total),
 	};
+	const tokens: UsageTokens = {
+		input: counts.input ?? 0,
+		output: counts.output ?? 0,
+		cacheRead: counts.cacheRead ?? 0,
+		cacheWrite: counts.cacheWrite ?? 0,
+		reasoning: counts.reasoning ?? 0,
+		total: counts.total ?? 0,
+	};
+	// A source that omitted a counter makes the sum a lower bound. A stored line
+	// states the flag explicitly, so an incomplete record survives the round trip;
+	// otherwise presence is derived from the counters themselves.
+	const declaredComplete = usage.tokensComplete;
+	const tokensComplete = declaredComplete === false ? false : Object.values(counts).every((value) => value !== undefined);
 	const effort = typeof message.thinkingLevel === "string" ? message.thinkingLevel : undefined;
 	const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
 	return {
@@ -203,6 +224,7 @@ export function parseTranscriptLine(line: string, context: TranscriptReadContext
 			provider: text(message.provider, UNKNOWN),
 			...(effort ? { effort } : {}),
 			tokens,
+			tokensComplete,
 			cost: reportedCostOrAbsent(total),
 			costBreakdown: breakdownOf(costSource),
 			sessionId: context.sessionId,

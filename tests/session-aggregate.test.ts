@@ -143,6 +143,34 @@ test("session totals carry hand-computed tokens, cost, ratios and counts", () =>
 	assert.equal(result.ratios.tokensPerTurn, 191);
 });
 
+test("a record whose source omitted a token counter makes the token figure partial", () => {
+	const record = (overrides: Partial<AggregationRecord> = {}): AggregationRecord => ({
+		source: "parent",
+		sessionId: "s",
+		timestamp: 1,
+		model: "m",
+		provider: "p",
+		tokens: tokens({}),
+		cost: reportedCost(0),
+		...overrides,
+	});
+
+	// A reported all-zero set is a measurement; only an omitted counter is absence.
+	assert.deepEqual(aggregate([record()]).tokens, tokenFigure({}), "a reported all-zero set stays measured");
+
+	const partial = aggregate([record({ tokensComplete: false })]);
+	assert.equal(partial.tokens.provenance, "partial", "an omitted counter is never a measured zero");
+	assert.equal(partial.tokens.total, 0, "the known lower bound is still shown");
+	assert.equal(partial.cost.provenance, "measured", "the reported cost is unaffected");
+	assert.equal(partial.perModel[0]?.tokens.provenance, "partial", "the breakdown inherits the partial token figure");
+	assert.equal(partial.perAgentClass[0]?.tokens.provenance, "partial");
+
+	// One incomplete record is enough; a later complete one cannot launder it.
+	const mixed = aggregate([record({ tokensComplete: false }), record({ timestamp: 2, tokens: tokens({ total: 20 }) })]);
+	assert.equal(mixed.tokens.provenance, "partial", "a partial token total never returns to measured");
+	assert.equal(mixed.tokens.total, 20, "every reported token is still counted");
+});
+
 test("an unreported subagent cost marks the total partial and never silently shrinks it", () => {
 	const result = aggregate(FIXTURE);
 	const worker = result.perSubagent.find((entry) => entry.taskId === "S1");

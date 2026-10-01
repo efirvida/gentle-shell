@@ -111,6 +111,22 @@ test("a written record round-trips through I3's reader with identical numbers", 
 	assert.deepEqual(foldSessionCost(stored.records.map((entry) => entry.cost)), foldSessionCost(source.records.map((entry) => entry.cost)));
 });
 
+test("an incomplete token set survives the store round trip as incomplete", async () => {
+	const file = join(root, "token-state", "usage.jsonl");
+	await appendUsageRecords(file, [record("s1", BASE, 1_000_000, { tokensComplete: false })]);
+	const stored = await readUsageRecords(file);
+	assert.equal(stored.records.length, 1);
+	assert.equal(stored.records[0]?.tokensComplete, false, "the stored line states the flag the written counters cannot");
+
+	// The line stays parseable by I3's reader, which is where the flag is read back.
+	const line = readFileSync(file, "utf8").trim();
+	const { parseTranscriptLine } = await import("../lib/session-transcript.ts");
+	const result = parseTranscriptLine(line, { source: "parent", sessionId: "s1", transcriptPath: file });
+	assert.equal(result.kind, "usage");
+	if (result.kind !== "usage") return;
+	assert.equal(result.record.tokensComplete, false);
+});
+
 test("a store line is parseable by I3's parseTranscriptLine as-is", async () => {
 	const file = join(root, "parseable", "usage.jsonl");
 	await appendUsageRecords(file, [record("s1", BASE, 1_234_567)]);

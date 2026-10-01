@@ -56,7 +56,7 @@ Pi's `setWidget` is the only fire-and-forget RPC push structured enough to carry
 
 ## Provenance and unavailable markers
 
-Every monetary and token figure carries `provenance`: `measured` while every component was reported, `partial` as soon as one component reported no cost, forever. An unavailable ratio is `null`, never a blank or a zero. Counts carry provenance too: the orchestrator's own tool calls are not in a usage record, so an aggregate that includes a parent record reports its `toolCalls` count as `partial` rather than a silently smaller number.
+Every monetary and token figure carries `provenance`: `measured` while every component was reported, `partial` as soon as one component reported no cost, forever. A token figure is `partial` when any contributing record's source omitted a token counter, so a summed lower bound is never presented as a measured zero. An unavailable ratio is `null`, never a blank or a zero. Counts carry provenance too: the orchestrator's own tool calls are not in a usage record, so an aggregate that includes a parent record reports its `toolCalls` count as `partial` rather than a silently smaller number.
 
 ## Bounds
 
