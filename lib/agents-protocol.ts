@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { sanitizeTerminalText } from "./terminal-theme.ts";
-import { accumulateTaskCost, childUsageCost, type UsageCost } from "./session-usage.ts";
+import { accumulateTaskCost, accumulateTaskTokens, childUsageCost, type UsageCost } from "./session-usage.ts";
 
 // Gentle Agents protocol. A child pi process streams RPC events; the host
 // turns each one into a small typed delta, applies it to an append-only,
@@ -70,7 +70,7 @@ export interface AgentSettledEvent { type: typeof TASK_EVENT.AGENT_SETTLED }
 export interface ErrorEvent { type: typeof TASK_EVENT.ERROR; message: string }
 export interface AskEvent { type: typeof TASK_EVENT.ASK; request: AskRequest }
 export interface NoteEvent { type: typeof TASK_EVENT.NOTE; text: string }
-export interface UsageEvent { type: typeof TASK_EVENT.USAGE; tokens: number; cost: UsageCost }
+export interface UsageEvent { type: typeof TASK_EVENT.USAGE; tokens: number; tokensComplete: boolean; cost: UsageCost }
 
 export type ChildUnavailable = Readonly<{ state: "unavailable" }>;
 export type ChildMetadata = Readonly<{ state: "observed"; value: string }> | ChildUnavailable;
@@ -137,6 +137,8 @@ export interface TaskRecord {
 	turns: number;
 	toolCalls: number;
 	tokens: number;
+	/** False once any usage event reported no token counters; absent means complete (legacy records). */
+	tokensComplete?: boolean;
 	cost: number;
 	/** False once any usage event reported no cost; absent means complete (legacy records). */
 	costComplete?: boolean;
@@ -213,6 +215,20 @@ function childTokens(value: unknown): ChildTokenMeasurement {
 	// SDK default zeros are not provider-presence evidence (same as primary adapter).
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0 && value <= 1_000_000_000
 		? Object.freeze({ state: "reported", value }) : CHILD_UNAVAILABLE;
+}
+
+/**
+ * True when a usage payload carried at least one positive token counter. An
+ * all-zero or empty usage is "not reported", exactly as `childTokens` decides
+ * for the observation channel: the SDK injects zeros, so zero is not evidence
+ * that the provider reported zero tokens.
+ */
+function providerTokensReported(usage: Raw | undefined): boolean {
+	for (const field of ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "reasoning"] as const) {
+		const value = usage?.[field];
+		if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return true;
+	}
+	return false;
 }
 
 function childResponse(message: Raw): ChildResponseObservation | undefined {
@@ -317,7 +333,7 @@ export function normalizeRpcEvent(raw: unknown, options: { observeResponses?: bo
 			const usage = message?.role === "assistant" ? (message.usage as Raw | undefined) : undefined;
 			const events: TaskEvent[] = [];
 			if (usage) {
-				events.push({ type: TASK_EVENT.USAGE, tokens: Number(usage.totalTokens ?? 0) || 0, cost: childUsageCost(usage) });
+				events.push({ type: TASK_EVENT.USAGE, tokens: Number(usage.totalTokens ?? 0) || 0, tokensComplete: providerTokensReported(usage), cost: childUsageCost(usage) });
 			}
 			if (options.observeResponses === true && message?.role === "assistant") {
 				const observation = childResponse(message);
@@ -440,7 +456,7 @@ function recordPatch(task: TaskRecord, event: TaskEvent): Partial<TaskRecord> {
 		case TASK_EVENT.TEXT:
 			return { ...resumed, lastStep: task.lastStep === "queued" || task.lastStep === "starting" ? "writing" : task.lastStep };
 		case TASK_EVENT.USAGE:
-			return { ...resumed, tokens: task.tokens + event.tokens, ...accumulateTaskCost(task, event.cost) };
+			return { ...resumed, tokens: task.tokens + event.tokens, tokensComplete: accumulateTaskTokens(task, event.tokensComplete), ...accumulateTaskCost(task, event.cost) };
 		default:
 			return resumed;
 	}

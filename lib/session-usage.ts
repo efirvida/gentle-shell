@@ -83,6 +83,13 @@ export interface SessionUsageRecord {
 	readonly provider: string;
 	readonly effort?: string;
 	readonly tokens: UsageTokens;
+	/**
+	 * False when the source omitted at least one token counter, so `tokens` is a
+	 * lower bound and the aggregated figure must render as partial. Absent means
+	 * complete, for a legacy record written before this distinction existed. A
+	 * reported all-zero set stays complete.
+	 */
+	readonly tokensComplete?: boolean;
 	readonly cost: UsageCost;
 	/** Present when the source carries a per-component split; a transcript does. */
 	readonly costBreakdown?: UsageCostBreakdown;
@@ -200,6 +207,21 @@ export interface TaskCostLike {
 export function accumulateTaskCost(current: TaskCostLike, cost: UsageCost): { cost: number; costComplete: boolean } {
 	const nanoUsd = reportedCost(current.cost).nanoUsd + (cost.state === "reported" ? cost.nanoUsd : 0);
 	return { cost: nanoUsd / NANO_USD_SCALE, costComplete: current.costComplete !== false && cost.state === "reported" };
+}
+
+/** The minimal slice of a task record the delegated token fold reads. */
+export interface TaskTokenLike {
+	readonly tokensComplete?: boolean;
+}
+
+/**
+ * Task accumulation for tokens (I1), the exact counterpart of
+ * `accumulateTaskCost`: one absent component makes the token total partial for
+ * good, and a legacy record without the flag stays complete until one reports
+ * absence.
+ */
+export function accumulateTaskTokens(current: TaskTokenLike, reported: boolean): boolean {
+	return current.tokensComplete !== false && reported;
 }
 
 /** Delegated ingestion (I2): fold every subagent's known cost into one partial-aware total for the bar. */

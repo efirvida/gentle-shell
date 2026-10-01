@@ -142,10 +142,43 @@ test("parseTranscriptLine yields the canonical record with model, tokens, cost s
 	assert.equal(record.effort, "high");
 	assert.equal(record.timestamp, Date.parse("2026-09-29T19:52:32.384Z"));
 	assert.deepEqual(record.tokens, { input: 18_856, output: 157, cacheRead: 2_048, cacheWrite: 0, reasoning: 55, total: 21_061 });
+	assert.equal(record.tokensComplete, true, "every counter present is a complete token set");
 	assert.equal(sessionCostUsd(foldSessionCost([record.cost])), 0.002928744);
 	assert.equal(record.costBreakdown?.input.state, "reported");
 	assert.equal(record.costBreakdown?.cacheWrite.state, "reported");
 	assert.equal(record.identified, true);
+});
+
+test("an omitted token counter stays absent instead of becoming a measured zero", () => {
+	const context = { source: "parent" as const, sessionId: PARENT_ID, transcriptPath: parentFile };
+
+	// The observed provider shape: a usage object that carries a cost and no counter at all.
+	const onlyCost = parseTranscriptLine(JSON.stringify(assistantLine({ id: "z1", timestamp: "2026-09-29T19:53:00.000Z", usage: { cost: { total: 0 } } })), context);
+	assert.equal(onlyCost.kind, "usage");
+	if (onlyCost.kind !== "usage") return;
+	assert.equal(onlyCost.record.tokensComplete, false, "an empty counter set is a lower bound, not a measured zero");
+	assert.deepEqual(onlyCost.record.tokens, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 });
+	assert.equal(onlyCost.record.cost.state, "reported", "the reported zero cost is untouched");
+
+	// Real transcripts do omit a single counter (reasoning) while the rest is present.
+	const partial = parseTranscriptLine(
+		JSON.stringify(assistantLine({ id: "z2", timestamp: "2026-09-29T19:53:01.000Z", usage: { input: 5, output: 3, cacheRead: 1, cacheWrite: 0, totalTokens: 9, cost: {} } })),
+		context,
+	);
+	assert.equal(partial.kind, "usage");
+	if (partial.kind !== "usage") return;
+	assert.equal(partial.record.tokensComplete, false, "one missing counter makes the whole set a lower bound");
+	assert.equal(partial.record.tokens.reasoning, 0, "the missing counter sums as 0 but never as measured");
+	assert.equal(partial.record.tokens.input, 5);
+
+	// A stored line states the flag explicitly, because the store writes the counters it knows.
+	const declared = parseTranscriptLine(
+		JSON.stringify(assistantLine({ id: "z3", timestamp: "2026-09-29T19:53:02.000Z", usage: { input: 5, output: 3, cacheRead: 1, cacheWrite: 0, reasoning: 0, totalTokens: 9, tokensComplete: false, cost: {} } })),
+		context,
+	);
+	assert.equal(declared.kind, "usage");
+	if (declared.kind !== "usage") return;
+	assert.equal(declared.record.tokensComplete, false, "the stored flag wins over the counters it had to write");
 });
 
 test("parseTranscriptLine classifies a non-usage line as skip and an unusable line as malformed", () => {
