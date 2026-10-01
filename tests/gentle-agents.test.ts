@@ -4,7 +4,8 @@ import { execFileSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
-import { pendingReviewMutation, REVIEW_REMINDER_RECEIPT } from "../lib/review-reminder-receipt.ts";
+import { fileURLToPath } from "node:url";
+import { pendingReviewMutation, pendingReviewMutationProfiles, REVIEW_REMINDER_RECEIPT } from "../lib/review-reminder-receipt.ts";
 import { SESSION_WORKTREE_ENTRY, SESSION_WORKTREE_CHANGED, resolveSessionWorktree } from "../lib/session-worktree-registry.ts";
 import { installSessionChangeCapture } from "../lib/session-change-capture.ts";
 import { SessionChanges, type SessionChangeEvidence } from "../lib/session-changes.ts";
@@ -13,7 +14,7 @@ import type { TestContext } from "node:test";
 import { generateUnifiedPatch, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { visibleWidth, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { sidebarState } from "../lib/shell-sidebar.ts";
-import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, answerThroughUi, completionText, createDefaultSessionTransport, legacySubagentsInstalled, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
+import gentleAgents, { agentRuntimePaths, agentsCollapseKey, agentsEnabled, agentsStopKey, agentsViewKey, agentResultPreview, answerThroughUi, childContextExtensionPaths, completionText, createDefaultSessionTransport, legacySubagentsInstalled, type AgentsDeps, type SessionTransportFactory } from "../extensions/gentle-agents.ts";
 import { ActiveSessionClient, ActiveSessionListener, SessionPresenceRegistry } from "../lib/agents-session-transport.ts";
 import { WindowsActiveSessionClient, WindowsActiveSessionListener } from "../lib/windows-session-transport.ts";
 import { historyDir, loadHistory, saveTask } from "../lib/agents-history.ts";
@@ -1687,6 +1688,56 @@ for (const scenario of ["own", "other-root", "escaped", "sibling", "session-swit
 	});
 }
 
+// gentle-pi#1175 (T2): the subagent mutation receipt carries the model and
+// effort the runtime resolved for the task, so ASSESS never re-trusts a model
+// declaration. An inherited (unresolved) model is omitted, never "default".
+for (const scenario of ["resolved", "inherited"] as const) {
+	test(`subagent mutation receipt records the runtime-resolved writer profile: ${scenario}`, async () => {
+		const h = fakePi();
+		const d = deps();
+		const { ctx } = fakeContext();
+		if (scenario === "inherited") {
+			const fixtureHome = realpathSync(mkdtempSync(join(root, "inherited-writer-")));
+			mkdirSync(join(fixtureHome, ".pi", "agent", "agents"), { recursive: true });
+			writeFileSync(join(fixtureHome, ".pi", "agent", "agents", "explore.md"), "---\ndescription: inherits the parent model\ntools: [read]\n---\nYou map things.");
+			d.deps.home = fixtureHome;
+		}
+		ctx.sessionManager.getEntries = (() => h.entries) as typeof ctx.sessionManager.getEntries;
+		ctx.sessionManager.getBranch = (() => h.entries) as typeof ctx.sessionManager.getBranch;
+		d.deps.resolveWorktree = (path, base) => containsResolvedPath(cwd, resolve(base, path)) ? { root: cwd, commonDir: "/fixture/common" } : undefined;
+		const spawn = d.deps.spawn!;
+		d.deps.spawn = (...args) => {
+			const child = spawn(...args);
+			const on = child.on.bind(child);
+			child.on = ((event: string, listener: () => void) => {
+				if (event === "spawn") queueMicrotask(listener);
+				return on(event as "spawn", listener);
+			}) as typeof child.on;
+			return child;
+		};
+		gentleAgents(h.pi, {}, d.deps);
+		await h.fire("session_start", ctx);
+		await h.tools.get("subagent_run")!.execute("mutation", { agent: "explore", task: "Write", mode: "background", workspace_root: cwd }, undefined, undefined, ctx);
+		await tick();
+		d.children[0].emit({ type: "tool_execution_start", toolCallId: "write", toolName: "write", args: { path: "file.ts" } });
+		d.children[0].emit({ type: "tool_execution_end", toolCallId: "write", isError: false, result: { content: [] } });
+		await tick();
+		const receipts = h.entries.filter((entry) => entry.customType === REVIEW_REMINDER_RECEIPT);
+		assert.equal(receipts.length, 1);
+		const data = receipts[0].data as Record<string, unknown>;
+		if (scenario === "resolved") {
+			assert.equal(data.writerModelId, "openai-codex/gpt-5.6-terra");
+			assert.equal(data.writerEffort, "low", "the profile effort override is the runtime-resolved effort");
+		} else {
+			assert.equal(Object.hasOwn(data, "writerModelId"), false, "an inherited model is unknown here and must never be recorded as \"default\"");
+			assert.equal(Object.hasOwn(data, "writerEffort"), false);
+		}
+		assert.deepEqual(pendingReviewMutationProfiles(ctx.sessionManager, cwd), [scenario === "resolved" ? { writerModelId: "openai-codex/gpt-5.6-terra", writerEffort: "low" } : {}]);
+		await h.fire("session_shutdown", ctx);
+		await tick();
+	});
+}
+
 // C1 diagnostics (odd/tasks/usage-click-and-changes-attribution.md): the
 // guard chain's posture is unchanged (spawn-gated registration stays, a
 // parent decision) -- these only verify each drop explains itself once, in
@@ -1991,7 +2042,7 @@ test("default Node spawn adapter distinguishes IPC-only and permission-capable c
 		children[2]!.emit({ type: "agent_settled" });
 		await permission.result;
 
-		const args = ["--host-flag", "--mode", "rpc", "--session-dir", join(home, ".pi", "agent", "gentle-agents", "sessions"), "--model", "openai-codex/gpt-5.6-terra:low", "--tools", "read,grep,subagent_parent_message", "--append-system-prompt", "You map things."];
+		const args = ["--host-flag", "--mode", "rpc", "--session-dir", join(home, ".pi", "agent", "gentle-agents", "sessions"), ...childContextExtensionPaths().flatMap((path) => ["--extension", path]), "--model", "openai-codex/gpt-5.6-terra:low", "--tools", "read,grep,subagent_parent_message", "--append-system-prompt", "You map things."];
 		assert.equal(captured.length, 3, "the extension reaches Node's spawn boundary for IPC-only and permission-channel launches");
 		const permissionChannelStdio = process.platform === "win32" ? "overlapped" : "pipe";
 		for (const [index, fixture] of ["task", "background", "permission"].entries()) {
@@ -3077,6 +3128,62 @@ test("completionText names the outcome before the answer", () => {
 	const base = { id: "t1", agent: "explore", mode: "background", prompt: "p", label: "map lib", cwd: "/r", parentSessionId: "s", status: "failed" as const, createdAt: 1, startedAt: 1, endedAt: 2, model: "m", thinking: undefined, sessionPath: null, error: "pi exited with code 1", result: null, lastStep: "x", lastActivityAt: 2, turns: 0, toolCalls: 0, tokens: 0, cost: 0 };
 	assert.equal(completionText(base), 'Subagent explore (task t1, "map lib") failed.\n\nSubagent explore failed: pi exited with code 1');
 	assert.equal(completionText({ ...base, status: "timed_out", error: "stalled for 4 min" }), 'Subagent explore (task t1, "map lib") timed out.\n\nSubagent explore timed_out: stalled for 4 min');
+});
+
+test("the Agent result card previews the answer or error when collapsed and keeps the full completion text expanded", () => {
+	const { pi, renderers } = fakePi();
+	gentleAgents(pi, {}, deps().deps);
+	const render = renderers.get("gentle-agents.result")!;
+	const base = { id: "t1", agent: "explore", mode: "background", prompt: "p", label: "map lib", cwd: "/r", parentSessionId: "s", status: "completed" as const, createdAt: 1, startedAt: 1, endedAt: 2, model: "m", thinking: undefined, sessionPath: null, error: null, result: "All done.", lastStep: "x", lastActivityAt: 2, turns: 0, toolCalls: 0, tokens: 0, cost: 0 };
+	const message = (task: typeof base | (Omit<typeof base, "status" | "error"> & { status: "failed"; error: string })) => ({ customType: "gentle-agents.result", content: completionText(task as Parameters<typeof completionText>[0]), details: { gentleAgents: { agent: task.agent, status: task.status } } });
+	const taggedTheme = { fg: (color: string, text: string) => `<${color}>${text}</${color}>` };
+
+	const done = render(message(base), { expanded: false }, plainTheme).render(80).map(stripAnsi);
+	assert.ok(done.length <= 5, "the collapsed card stays bounded");
+	assert.match(done[0]!, /^╭─ ❀ Agent result · explore ─+ expand ╮$/);
+	assert.match(done[1]!, /^│ All done\. +│$/, "the answer leads the collapsed preview");
+	assert.doesNotMatch(done.join("\n"), /Subagent explore \(task/, "the bookkeeping header stays out of the collapsed preview");
+	assert.match(render(message(base), { expanded: false }, taggedTheme).render(80)[0]!, /^<success>╭/);
+
+	const failed = { ...base, status: "failed" as const, error: "pi exited with code 1", result: null };
+	const failedRows = render(message(failed as never), { expanded: false }, taggedTheme).render(80);
+	assert.match(failedRows[0]!, /^<error>╭/, "a failed result keeps the error frame");
+	assert.match(stripAnsi(failedRows[1]!.replace(/<\/?[a-z]+>/g, "")), /^│ Subagent explore failed: pi exited with code 1 +│$/, "the error leads the collapsed preview");
+
+	const long = { ...base, result: "one\ntwo\n\nthree\nfour\nfive" };
+	const collapsed = render(message(long), { expanded: false }, plainTheme).render(80).map(stripAnsi);
+	assert.deepEqual(collapsed.slice(1, -1).map((row) => row.slice(2).trim().replace(/ │$/, "").trim()), ["one", "two", "three"], "three non-blank answer rows");
+	assert.match(collapsed.at(-1)!, /^╰─+╯$/);
+	const expanded = render(message(long), { expanded: true }, plainTheme).render(80).map(stripAnsi).join("\n");
+	assert.match(expanded, /Subagent explore \(task t1, "map lib"\) finished\./, "expanded keeps the header");
+	for (const line of ["one", "two", "three", "four", "five"]) assert.match(expanded, new RegExp(`│ ${line} +│`));
+
+	const legacy = { customType: "gentle-agents.result", content: [{ type: "text", text: "Older answer without a header." }], details: { gentleAgents: { agent: "explore", status: "completed" } } };
+	assert.match(render(legacy, { expanded: false }, plainTheme).render(80).map(stripAnsi)[1]!, /^│ Older answer without a header\. +│$/, "headerless content falls back to the full text");
+	assert.equal(agentResultPreview('Subagent explore (task t1, "x") finished.\n\n'), 'Subagent explore (task t1, "x") finished.\n\n', "a header without an answer keeps the full text");
+	assert.equal(agentResultPreview("Plain answer.\n\nMore."), "Plain answer.\n\nMore.");
+
+	for (const width of [0, 1, 2, 3, 4, 5, 6, 7, 8, 24]) {
+		const rows = render(message(long), { expanded: false }, plainTheme).render(width);
+		if (width === 0) assert.deepEqual(rows, []);
+		assert.ok(rows.length <= 5, `width ${width} stays within the row budget`);
+		for (const row of rows) assert.ok(visibleWidth(row) <= width, `width ${width} row fits: ${JSON.stringify(row)}`);
+	}
+});
+
+test("the Stale agent result card previews its truthful warning when collapsed", () => {
+	const { pi, entryRenderers } = fakePi();
+	gentleAgents(pi, {}, deps().deps);
+	const render = entryRenderers.get("gentle-agents.stale-result")!;
+	const entry = { type: "custom", customType: "gentle-agents.stale-result", data: { taskId: "t9", agent: "explore", label: "map lib", status: "completed", ageSeconds: 120 } };
+	const collapsed = render(entry, { expanded: false }, plainTheme).render(80).map(stripAnsi);
+	assert.ok(collapsed.length > 3 && collapsed.length <= 5, "a bounded multi-row preview");
+	assert.match(collapsed[0]!, /^╭─ ❀ Stale agent result · explore · task t9 ─+ expand ╮$/);
+	assert.match(collapsed.join("\n"), /Subagent explore \(task t9, "map lib"\) completed about 2m ago/);
+	assert.doesNotMatch(collapsed.join("\n"), /All done|Last answer/, "no invented answer");
+	assert.match(render(entry, { expanded: false }, { fg: (color: string, text: string) => `<${color}>${text}</${color}>` }).render(80)[0]!, /^<warning>╭/);
+	assert.match(render(entry, { expanded: true }, plainTheme).render(80).map(stripAnsi).join("\n"), /subagent_status and subagent_result/);
+	assert.deepEqual(render(entry, { expanded: false }, plainTheme).render(0), []);
 });
 
 test("a task-mode child's dialog reaches the host UI and the answer goes back to the child", async () => {
@@ -4253,3 +4360,31 @@ test("issue #1162: task-mode subagent_run includes question directly in waiting 
 	await fire("session_shutdown", ctx);
 });
 
+
+// gentle-shell#1587: children do not load the gentle-pi package in the
+// isolated Gentle Shell home, so every child receives the child-context
+// extension explicitly through --extension.
+test("children receive context and safety extensions, and missing files are omitted", async () => {
+	const expected = join(dirname(fileURLToPath(import.meta.url)), "..", "extensions", "child-context.ts");
+	const safety = join(dirname(fileURLToPath(import.meta.url)), "..", "extensions", "child-safety.ts");
+	assert.deepEqual(childContextExtensionPaths(), [resolve(expected), resolve(safety)]);
+	assert.deepEqual(childContextExtensionPaths(() => false), [], "a missing extension file fails safe to no --extension");
+	const extensionArguments = (args: string[]) => args.filter((_, index) => args[index - 1] === "--extension");
+	for (const scenario of ["present", "missing"] as const) {
+		const h = fakePi();
+		const runtime = deps();
+		if (scenario === "missing") runtime.deps.childExtensionPaths = [];
+		gentleAgents(h.pi, {}, runtime.deps);
+		const { ctx } = fakeContext();
+		await h.fire("session_start", ctx);
+		try {
+			await h.tools.get("subagent_run")!.execute(`child-context-${scenario}`, { agent: "explore", task: "Map", mode: "background" }, undefined, undefined, ctx);
+			await tick();
+			assert.equal(runtime.spawned.length, 1);
+			assert.deepEqual(extensionArguments(runtime.spawned[0]!), scenario === "present" ? [resolve(expected), resolve(safety)] : []);
+		} finally {
+			await h.fire("session_shutdown", ctx);
+			await tick();
+		}
+	}
+});

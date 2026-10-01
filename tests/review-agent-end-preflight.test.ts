@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { existsSync, realpathSync } from "node:fs";
-import { mkdir, mkdtemp, rename, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import test, { after, before } from "node:test";
+import type { ExtensionAPI, ExtensionContext, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { createGentleAiExtension } from "../extensions/gentle-ai.ts";
 import { NATIVE_REVIEW_ERROR_CODE, NativeReviewCliError, type NativeReviewCli } from "../lib/native-review-cli.ts";
 import type { ReviewStatusV3 } from "../lib/review-integration-v2.ts";
@@ -28,6 +28,39 @@ import type { ReviewStatusV3 } from "../lib/review-integration-v2.ts";
 type AnyHandler = (event: unknown, ctx: ExtensionContext) => unknown;
 type RegisteredTool = Parameters<ExtensionAPI["registerTool"]>[0];
 type SentMessage = { message: Record<string, unknown>; options: Record<string, unknown> };
+
+let fixtureCwd: string;
+let fixtureRoot: string | undefined;
+const fixtureEnvironment: NodeJS.ProcessEnv = {};
+const previousEnvironment = new Map<string, string | undefined>();
+before(async () => {
+	const root = await mkdtemp(join(tmpdir(), "gentle-pi-preflight-"));
+	fixtureRoot = root;
+	fixtureCwd = join(root, "project");
+	const home = join(root, "home");
+	for (const directory of [fixtureCwd, home, join(fixtureCwd, "src"), join(fixtureCwd, "tests")]) await mkdir(directory);
+	await writeFile(join(fixtureCwd, "src/example.ts"), "export const value = 1;");
+	childProcess.execFileSync("git", ["init", "--quiet", fixtureCwd]);
+	fixtureCwd = realpathSync(fixtureCwd);
+	Object.assign(fixtureEnvironment, {
+		HOME: home, USERPROFILE: home,
+		GENTLE_PI_CONFIG_HOME: join(home, "config"),
+		GENTLE_PI_AGENT_HOME: join(home, "agents"),
+		PI_CODING_AGENT_DIR: join(home, "pi"),
+		XDG_CONFIG_HOME: join(home, "xdg"),
+	});
+	for (const [key, value] of Object.entries(fixtureEnvironment)) {
+		previousEnvironment.set(key, process.env[key]);
+		process.env[key] = value;
+	}
+});
+after(async () => {
+	for (const [key, value] of previousEnvironment) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	if (fixtureRoot !== undefined) await rm(fixtureRoot, { recursive: true, force: true });
+});
 
 type CustomEntry = { type: string; customType: string; data: unknown };
 function harness(nativeReviewCli: NativeReviewCli | null, entries: CustomEntry[] = [], processEnv?: NodeJS.ProcessEnv): {
@@ -53,17 +86,32 @@ function harness(nativeReviewCli: NativeReviewCli | null, entries: CustomEntry[]
 			sent.push({ message, options });
 		},
 	} as unknown as ExtensionAPI;
-	createGentleAiExtension({ nativeReviewCli, processEnv })(pi);
+	createGentleAiExtension({
+		nativeReviewCli,
+		processEnv: { ...fixtureEnvironment, GENTLE_PI_AGENTS_CHILD: "0", ...processEnv, GENTLE_AI_TELEMETRY: "0" },
+		resolveTelemetryTriggerBinary: () => join(fixtureCwd, "never-executed"),
+		telemetryTriggerSpawn: () => assert.fail("Preflight fixtures must not spawn telemetry"),
+	})(pi);
 	return { handlers, sent, tools };
 }
 
-function ctx(sessionId: string, hasUI = true, cwd = process.cwd()): ExtensionContext {
+function ctx(sessionId: string, hasUI = true, cwd = fixtureCwd): ExtensionContext {
 	return {
 		cwd,
 		hasUI,
 		ui: { notify() {} },
 		sessionManager: { getSessionId: () => sessionId },
 	} as unknown as ExtensionContext;
+}
+
+function toolContext(context: ExtensionContext): ExtensionToolContext {
+	return {
+		...context,
+		tools: [],
+		async executeTool() {
+			assert.fail("Review preflight must not execute nested tools");
+		},
+	};
 }
 
 async function withSessionStartEnv<T>(callback: (cwd: string) => Promise<T>, initializeGit = true): Promise<T> {
@@ -127,7 +175,7 @@ const agentEndEvent = { type: "agent_end", messages: [] };
 let mutationCall = 0;
 async function directWrite(handlers: Map<string, AnyHandler>, session: ExtensionContext): Promise<void> {
 	await handlers.get("tool_result")!({ type: "tool_result", toolName: "write", toolCallId: `own-${++mutationCall}`,
-		input: { path: session.cwd === process.cwd() || session.cwd === realpathSync(process.cwd()) ? "tests/review-agent-end-preflight.test.ts" : "src/example.ts" },
+		input: { path: "src/example.ts" },
 		content: [], isError: false }, session);
 }
 
@@ -138,7 +186,7 @@ for (const scenario of ["same", "changed", "sibling-root", "nested-root", "faile
 	test(`agent_end after approved acknowledgement: ${scenario}`, async (t) => {
 		const changedTarget = scenario === "changed";
 		const unsuccessful = scenario === "failed" || scenario === "unknown";
-		const cwd = realpathSync(process.cwd());
+		const cwd = fixtureCwd;
 		const siblingRoot = realpathSync(tmpdir());
 		if (scenario === "sibling-root") {
 			// Model a sibling worktree sharing the real common directory without
@@ -210,7 +258,7 @@ for (const scenario of ["same", "changed", "sibling-root", "nested-root", "faile
 		const review = tools.get("gentle_review");
 		assert.ok(review);
 		await directWrite(handlers, session);
-		const result = await review.execute("post-ack", { operation: "acknowledge-approved", lineageId }, undefined, undefined, session);
+		const result = await review.execute("post-ack", { operation: "acknowledge-approved", lineageId }, undefined, undefined, toolContext(session));
 		if (unsuccessful) {
 			assert.equal(result.details.outcome, scenario === "failed" ? "native-operation-failed" : "native-mutation-status-reconciled");
 			assert.equal(result.details.mutation_outcome, scenario === "failed" ? "none" : "unknown");

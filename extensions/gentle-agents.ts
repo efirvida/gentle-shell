@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import os from "node:os";
 import { join, resolve, isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import { keyHint, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text, type TUI } from "@earendil-works/pi-tui";
 import { invalidateSidebar } from "../lib/shell-sidebar-layout.ts";
@@ -18,7 +19,7 @@ import { VISUAL_SETTINGS_CHANGED } from "../lib/shell-sidebar.ts";
 import { resolveVisualSettings } from "../lib/visual-customization-policy.ts";
 import { createCompletionQueue } from "../lib/agents-completion-delivery.ts";
 import { createAgentMessageQueue, type PendingAgentMessage } from "../lib/agents-message-delivery.ts";
-import { AGENT_MODE, discoverAgents, loadAgentsConfig, resolveAgentProfile, withPinnedModelProfiles, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
+import { AGENT_MODE, discoverAgents, formatModelRef, loadAgentsConfig, resolveAgentProfile, withPinnedModelProfiles, type AgentDefinition, type AgentMode } from "../lib/agents-config.ts";
 import { resolveBackgroundSubagentsPolicy } from "../lib/background-subagents-policy.ts";
 import { installBackgroundCacheWarming } from "../lib/background-cache-warming.ts";
 import { isFinished, TASK_EVENT, TASK_STATUS, TaskStore, type AskRequest, type TaskRecord } from "../lib/agents-protocol.ts";
@@ -98,6 +99,22 @@ export interface AgentsDeps extends RunnerDeps {
 	runtimeMetricsPolicy?: RuntimeMetricsPolicyDeps;
 	metricsNow?: () => number;
 	metricsSchedule?: RunnerDeps["schedule"];
+	// Extensions every child loads with --extension (gentle-shell#1587).
+	childExtensionPaths?: string[];
+}
+
+// gentle-shell#1587: children do not load the gentle-pi package in the
+// isolated Gentle Shell home, so context filtering and destructive-command
+// safety are passed to every child explicitly. Missing files are omitted;
+// installations must include both entries to provide the delegated boundary.
+export function childContextExtensionPaths(exists: (path: string) => boolean = existsSync): string[] {
+	try {
+		return ["./child-context.ts", "./child-safety.ts"]
+			.map((path) => fileURLToPath(new URL(path, import.meta.url)))
+			.filter(exists);
+	} catch {
+		return [];
+	}
 }
 
 export function agentRuntimePaths(home: string, agentHome = join(home, ".pi", "agent")): { sessions: string; transcripts: string } {
@@ -124,6 +141,7 @@ const defaultDeps = (env: NodeJS.ProcessEnv): AgentsDeps => ({
 	home: os.homedir(),
 	resolveWorktree: resolveSessionWorktree,
 	env,
+	childExtensionPaths: childContextExtensionPaths(),
 });
 
 export function agentsEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -209,6 +227,22 @@ function text(value: string, details: Record<string, unknown> = {}, terminate = 
 	return { content: [{ type: "text", text: value }], details, ...(terminate ? { terminate: true } : {}) };
 }
 
+// gentle-pi#1175: the writer profile the runtime resolved for this task,
+// carried on its review-mutation receipt so ASSESS never trusts a model
+// re-declaration. `task.model` is the child's reported model once get_state
+// answers, or the launch profile's model. An inherited model is recorded as
+// the unresolved `formatModelRef(undefined)` placeholder; the parent's current
+// model is not reliable evidence (the child resolves its own default), so it is
+// omitted and ASSESS treats the writer as unknown, i.e. small.
+function runtimeWriterProfile(task: TaskRecord): { writerModelId?: string; writerEffort?: string } {
+	const modelId = typeof task.model === "string" && task.model !== formatModelRef(undefined) && task.model.trim() ? task.model : undefined;
+	const effort = typeof task.thinking === "string" && task.thinking.trim() ? task.thinking : undefined;
+	return {
+		...(modelId === undefined ? {} : { writerModelId: modelId }),
+		...(effort === undefined ? {} : { writerEffort: effort }),
+	};
+}
+
 function taskDetails(task: TaskRecord): Record<string, unknown> {
 	return { gentleAgents: { taskId: task.id, agent: task.agent, status: task.status, mode: task.mode, cwd: task.cwd } };
 }
@@ -251,10 +285,22 @@ export function resolveDefaultSubagentMode(input: {
 }
 
 // What the model reads when a background task ends: the outcome first, then
-// the answer itself. The card renderer shows the same text.
+// the answer itself. The expanded card shows the same text.
 export function completionText(task: TaskRecord): string {
 	const outcome = task.status === "completed" ? "finished" : task.status.replace("_", " ");
 	return `Subagent ${task.agent} (task ${task.id}, "${task.label}") ${outcome}.\n\n${finishedText(task)}`;
+}
+
+const COMPLETION_HEADER = /^Subagent [^\n]+ \(task [^\n]*\) [^\n]+\.$/;
+
+// The collapsed card leads with the answer or error: completionText's
+// bookkeeping paragraph stays for the model and the expanded card. Entries
+// without that header (older sessions) preview their full text.
+export function agentResultPreview(text: string): string {
+	const split = text.indexOf("\n\n");
+	if (split < 0 || !COMPLETION_HEADER.test(text.slice(0, split))) return text;
+	const rest = text.slice(split + 2);
+	return rest.trim() === "" ? text : rest;
 }
 
 // Host-side answer to a child's dialog: the same ctx.ui the human already
@@ -726,7 +772,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 				}
 				else if (resolvedPath !== undefined) noteDrop("evidence-path-mismatch");
 			}
-			if (!foreignTask) recordReviewMutation(pi, sessions, root, { source: "subagent", taskId: task.id, toolName: tool.toolName, toolCallId: tool.toolCallId });
+			if (!foreignTask) recordReviewMutation(pi, sessions, root, { source: "subagent", taskId: task.id, toolName: tool.toolName, toolCallId: tool.toolCallId, ...runtimeWriterProfile(task) });
 		},
 		onFinish: (task, observations) => {
 			// Completion is the only forwarding opportunity. No pending event, policy
@@ -773,12 +819,13 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 	pi.registerMessageRenderer(AGENTS_RESULT_TYPE, (message, options, theme) => {
 		const details = (message.details as { gentleAgents?: { agent?: string; status?: string } } | undefined)?.gentleAgents;
 		const content = message.content as string | Array<{ type: string; text?: string }>;
-		const body = (typeof content === "string" ? content : content.map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("\n")).split("\n");
+		const text = typeof content === "string" ? content : content.map((part) => (part.type === "text" ? (part.text ?? "") : "")).join("\n");
+		const body = options.expanded ? text.split("\n") : agentResultPreview(text).split("\n").filter((line) => line.trim() !== "");
 		const tone = details?.status === "completed" ? CARD_TONE.SUCCESS : CARD_TONE.ERROR;
 		const hint = expandHint(options.expanded);
 		return {
 			render(width: number) {
-				return renderCard({ title: "Agent result", subtitle: details?.agent, body, tone, glyph: AGENTS_GLYPH }, theme, width, { expanded: options.expanded, hint });
+				return renderCard({ title: "Agent result", subtitle: details?.agent, body, tone, glyph: AGENTS_GLYPH }, theme, width, { expanded: options.expanded, previewRows: 3, hint });
 			},
 			invalidate() {},
 		};
@@ -800,7 +847,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 		];
 		return {
 			render(width: number) {
-				return renderCard({ title: "Stale agent result", subtitle: `${agent} · task ${taskId}`, body, tone: CARD_TONE.WARNING, glyph: AGENTS_GLYPH }, theme, width, { expanded: options.expanded, hint: expandHint(options.expanded) });
+				return renderCard({ title: "Stale agent result", subtitle: `${agent} · task ${taskId}`, body, tone: CARD_TONE.WARNING, glyph: AGENTS_GLYPH }, theme, width, { expanded: options.expanded, previewRows: 3, hint: expandHint(options.expanded) });
 			},
 			invalidate() {},
 		};
@@ -1118,6 +1165,7 @@ export default function gentleAgents(pi: ExtensionAPI, env: NodeJS.ProcessEnv = 
 			thinking: profile.thinking,
 			sessionDir,
 			resumeSessionPath: resume,
+			...(deps.childExtensionPaths && deps.childExtensionPaths.length > 0 ? { extensionPaths: [...deps.childExtensionPaths] } : {}),
 			env: childEnv,
 			...(foreign || parentRepositoryIdentity === undefined ? {} : {
 				authorizeParentStandingReviewPermission: (repositoryIdentity: string) => {
