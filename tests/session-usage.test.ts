@@ -3,6 +3,7 @@ import test from "node:test";
 import {
 	ABSENT_COST,
 	accumulateTaskCost,
+	accumulateTaskTokens,
 	addSessionCost,
 	childUsageCost,
 	costUsd,
@@ -168,4 +169,15 @@ test("accumulateTaskCost stays on the nano-USD grid across repeated deltas", () 
 	let long: { cost: number; costComplete?: boolean } = { cost: 0 };
 	for (let index = 0; index < 1_000; index++) long = { ...long, ...accumulateTaskCost(long, reportedCost(0.000000001)) };
 	assert.equal(reportedCost(long.cost).nanoUsd, 1_000, "one-nano deltas do not accumulate error");
+});
+
+test("accumulateTaskTokens keeps a token set partial for good, exactly like cost", () => {
+	let task: { tokensComplete?: boolean } = {};
+	assert.equal(accumulateTaskTokens(task, true), true, "a legacy record without the flag stays complete");
+	task = { tokensComplete: accumulateTaskTokens(task, true) };
+	task = { tokensComplete: accumulateTaskTokens(task, false) };
+	assert.equal(task.tokensComplete, false, "one unreported set marks the task partial");
+	task = { tokensComplete: accumulateTaskTokens(task, true) };
+	assert.equal(task.tokensComplete, false, "a partial token total never becomes complete again");
+	assert.equal(accumulateTaskTokens({}, false), false);
 });

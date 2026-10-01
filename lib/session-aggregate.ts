@@ -134,6 +134,7 @@ interface MutableBucket {
 	nanoUsd: number;
 	absent: number;
 	complete: boolean;
+	tokensComplete: boolean;
 	input: number;
 	output: number;
 	cacheRead: number;
@@ -143,7 +144,7 @@ interface MutableBucket {
 }
 
 function emptyBucket(): MutableBucket {
-	return { turns: 0, nanoUsd: 0, absent: 0, complete: true, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
+	return { turns: 0, nanoUsd: 0, absent: 0, complete: true, tokensComplete: true, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, total: 0 };
 }
 
 function addRecord(bucket: MutableBucket, record: SessionUsageRecord): void {
@@ -154,6 +155,9 @@ function addRecord(bucket: MutableBucket, record: SessionUsageRecord): void {
 		bucket.absent += 1;
 	}
 	const tokens = record.tokens;
+	// One record whose source omitted a counter makes the whole token figure a
+	// lower bound; like cost, it never returns to measured.
+	if (record.tokensComplete === false) bucket.tokensComplete = false;
 	bucket.input += tokens.input;
 	bucket.output += tokens.output;
 	bucket.cacheRead += tokens.cacheRead;
@@ -174,7 +178,7 @@ function tokenFigure(bucket: MutableBucket): TokenFigure {
 		cacheWrite: bucket.cacheWrite,
 		reasoning: bucket.reasoning,
 		total: bucket.total,
-		provenance: "measured",
+		provenance: bucket.tokensComplete ? "measured" : "partial",
 	};
 }
 

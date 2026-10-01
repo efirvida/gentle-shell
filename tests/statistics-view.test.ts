@@ -168,3 +168,25 @@ test("render reads the model getter and never rebuilds an aggregate", () => {
 	view.render(80);
 	assert.equal(calls, 2, "one model read per render, no recomputation");
 });
+
+test("a partial token figure carries the same + marker as a partial cost", () => {
+	const record = (overrides: Partial<AggregationRecord> = {}): AggregationRecord => ({
+		source: "parent",
+		sessionId: "s1",
+		timestamp: 1000,
+		model: "m1",
+		provider: "p1",
+		tokens: tokens({}),
+		cost: reportedCost(0.001),
+		...overrides,
+	});
+
+	// A reported all-zero token set is a measurement and stays unmarked.
+	const measured = renderStatistics(buildStatisticsModel(aggregateUsage([record()], { now: () => 0 }), null, 0), 60).join("\n");
+	assert.match(measured, /0 tokens/);
+	assert.equal(measured.includes("0+ tokens"), false, "a measured zero carries no marker");
+
+	const partial = renderStatistics(buildStatisticsModel(aggregateUsage([record({ tokensComplete: false })], { now: () => 0 }), null, 0), 60).join("\n");
+	assert.match(partial, /0\+ tokens/, "an omitted counter renders as partial, never as a measured zero");
+	assert.match(partial, /measured unless \+ partial/);
+});
