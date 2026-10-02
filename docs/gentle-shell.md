@@ -188,11 +188,31 @@ With quiet tools enabled, `codemode` uses the same rounded **Code** card. The co
 
 Gentle Shell ships its own interactive tools instead of depending on third-party extensions; the built-ins replace `npm:pi-subagents-j0k3r` and `npm:@juicesharp/rpiv-todo` (see Gentle Agents and Gentle Todo below for the removal steps).
 
-- **`ask_user_question`** — one to four structured questions in a single questionnaire, each with two to four options, multi-select, per-option descriptions and previews — rendered as real TUI dialogs, usable in the live session.
+- **`ask_user_question`** — one to four structured questions in a single questionnaire, each with two to four options, multi-select, per-option descriptions and previews — rendered as real TUI dialogs, usable in the live session. While a question is pending the panel can be minimized to a persistent status bar so the transcript stays readable (see Minimizing the ask panel).
 - **`ask_user_choice`** — one exactly representable single-select question, with an opt-in free-text response.
 - **`todo`** — plan tracking with the Gentle Todo card (see Gentle Todo below).
 - **`gentle_review` / capture tools** — the native review surface for receipt-driven development.
 - **Optional companions** (separately installed, never bundled): `gentle-engram` for persistent memory, `pi-web-access` for web access when a task needs it and your policy allows it, `pi-lens` for additional inspection surfaces, `pi-intercom` for cross-session communication where your Pi setup supports it, and `@juicesharp/rpiv-ask-user-question` for interactive choice support where a separately installed extension fits your setup. These are companions, not hidden prerequisites or a claim that every Pi installation has every capability; persistent memory is **not** bundled with `gentle-pi`.
+
+### Minimizing the ask panel
+
+While an `ask_user_question` questionnaire is pending, the panel can be minimized to a persistent status bar so a short terminal gives its rows back to the transcript. Toggle with `app.tools.expand` (default `ctrl+o`) or click the bar; the expanded view names the resolved binding in its hint.
+
+| Indicator | Minimized shows |
+|-----------|-----------------|
+| `minimal` (default) | progress, question header, option count, the toggle hint and `esc cancel` |
+| `tabbed` | the existing tab strip, then `▸ minimized · <toggle> expand · esc cancel` |
+| `answers` | progress, header, the active question's committed answer (`answered: none` when unanswered) and the toggle hint |
+
+`/gentle:customize` → **Ask** sets the minimized indicator and the default state. Both persist in `ask-panel.json` in the Gentle Pi config home; a malformed file reads as the defaults and the panel refuses to overwrite it rather than silently replacing a hand edit.
+
+| Default state | Behavior |
+|---------------|----------|
+| `expanded` (default) | opens as the full panel; nothing changes for existing users |
+| `auto` | opens minimized only when the expanded panel would not fit the terminal, and stays minimized until toggled |
+| `collapsed` | always opens minimized |
+
+While minimized, only the toggle, `escape` and a click on the bar act; `up`/`down`/`enter`/`space` and `tab` are ignored so a minimized panel cannot commit an answer by accident, and navigation resumes on expand. The questionnaire mounts as a native dock swap, never an overlay, so the transcript keeps its native `pageUp`/`pageDown`, wheel and search scrolling throughout.
 
 ### Gentle Agents
 
